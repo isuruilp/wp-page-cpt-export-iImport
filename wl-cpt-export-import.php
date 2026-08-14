@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Page/CPT Export Import with ACF Media
- * Description: Export/import selected page or selected post type with content, featured images, content images, taxonomies, post meta, and ACF image/file/gallery fields. Media files can be embedded inside the JSON so a local site can be imported into a live site.
- * Version: 2.0.0
+ * Description: Export/import a selected page, post type, or taxonomy with content, featured images, content images, taxonomy terms (description, hierarchy, term meta and term images), post meta, and ACF image/file/gallery fields. Media files can be embedded inside the JSON so a local site can be imported into a live site, or the other way round.
+ * Version: 2.1.0
  * Author: Isuru Perera
  */
 
@@ -12,10 +12,11 @@ if (!defined('ABSPATH')) {
 
 class WL_Page_CPT_Export_Import_ACF_Media {
 
-    const SCHEMA_VERSION   = 2;
-    const SOURCE_URL_META  = '_wl_original_source_url';
-    const SOURCE_ID_META   = '_wl_source_attachment_id';
-    const SOURCE_SITE_META = '_wl_source_site';
+    const SCHEMA_VERSION     = 3;
+    const MIN_SCHEMA_VERSION = 2;
+    const SOURCE_URL_META    = '_wl_original_source_url';
+    const SOURCE_ID_META     = '_wl_source_attachment_id';
+    const SOURCE_SITE_META   = '_wl_source_site';
 
     private $uploads_cache       = null;
     private $attachment_id_cache = [];
@@ -30,7 +31,23 @@ class WL_Page_CPT_Export_Import_ACF_Media {
     private $url_replace   = [];
     private $source_base   = '';
 
+    private $term_manifest      = [];
+    private $term_queue         = [];
+    private $term_key_map       = [];
+    private $term_id_map        = [];
+    private $missing_taxonomies = [];
+    private $update_terms       = true;
+
     private $report = [];
+
+    private $internal_taxonomies = [
+        'nav_menu',
+        'link_category',
+        'post_format',
+        'wp_theme',
+        'wp_template_part_area',
+        'wp_pattern_category',
+    ];
 
     private $skip_meta_keys = [
         '_edit_lock',
@@ -68,6 +85,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
     public function admin_page() {
         $post_types = get_post_types(['public' => true], 'objects');
+        $taxonomies = $this->exportable_taxonomies();
 
         $pages = get_pages([
             'post_status' => ['publish', 'draft', 'pending', 'private'],
@@ -78,8 +96,8 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         $report = get_transient('wl_cpt_import_report_' . get_current_user_id());
         ?>
         <div class="wrap">
-            <h1>Page / CPT Export Import</h1>
-            <p>Export/import selected page or selected post type with ACF images and media.</p>
+            <h1>Page / CPT / Taxonomy Export Import</h1>
+            <p>Export/import a selected page, post type, or taxonomy with ACF images and media. Taxonomy terms travel with their description, hierarchy, term meta and term images.</p>
 
             <?php if (!empty($_GET['imported']) && is_array($report)) : ?>
                 <?php $this->render_import_report($report); ?>
@@ -101,6 +119,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                             <select name="export_type" id="wl_export_type" required>
                                 <option value="page">Page</option>
                                 <option value="post_type">Post Type</option>
+                                <option value="taxonomy">Taxonomy (terms only)</option>
                             </select>
                         </td>
                     </tr>
@@ -137,6 +156,40 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                                     </option>
                                 <?php endforeach; ?>
                             </select>
+                        </td>
+                    </tr>
+
+                    <tr id="wl_taxonomy_row" style="display:none;">
+                        <th scope="row">Select Taxonomy</th>
+                        <td>
+                            <select name="taxonomy" id="wl_taxonomy">
+                                <option value="">Select Taxonomy</option>
+
+                                <?php foreach ($taxonomies as $taxonomy) : ?>
+                                    <option value="<?php echo esc_attr($taxonomy->name); ?>">
+                                        <?php echo esc_html($taxonomy->label . ' (' . $taxonomy->name . ')'); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <p class="description">
+                                Exports every term of the taxonomy — name, slug, description, parent, term meta and
+                                any images attached to the terms (ACF term image/gallery fields, WooCommerce category
+                                thumbnails). No posts are included.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <tr id="wl_all_terms_row" style="display:none;">
+                        <th scope="row">Taxonomy Terms</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="include_all_terms" value="1">
+                                Also export every term of this post type's taxonomies
+                            </label>
+                            <p class="description">
+                                By default only the terms actually assigned to the exported posts travel. Turn this on
+                                to bring across the full term tree, including terms that currently have no posts.
+                            </p>
                         </td>
                     </tr>
 
@@ -198,6 +251,21 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                     </tr>
 
                     <tr>
+                        <th scope="row">Existing Terms</th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="update_terms" value="1" checked>
+                                Update terms that already exist on this site
+                            </label>
+                            <p class="description">
+                                A term is matched by slug, then by name. When this is on, the matched term's name,
+                                description, parent, term meta and term images are overwritten with the exported
+                                values. Turn it off to keep existing terms untouched and only attach posts to them.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <tr>
                         <th scope="row">Source URL Override</th>
                         <td>
                             <input type="url" name="source_url" class="regular-text" placeholder="https://staging.example.com">
@@ -219,15 +287,16 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                 const exportType = document.getElementById('wl_export_type');
                 const pageRow = document.getElementById('wl_page_row');
                 const postTypeRow = document.getElementById('wl_post_type_row');
+                const taxonomyRow = document.getElementById('wl_taxonomy_row');
+                const allTermsRow = document.getElementById('wl_all_terms_row');
 
                 function toggleExportFields() {
-                    if (exportType.value === 'page') {
-                        pageRow.style.display = '';
-                        postTypeRow.style.display = 'none';
-                    } else {
-                        pageRow.style.display = 'none';
-                        postTypeRow.style.display = '';
-                    }
+                    const value = exportType.value;
+
+                    pageRow.style.display = value === 'page' ? '' : 'none';
+                    postTypeRow.style.display = value === 'post_type' ? '' : 'none';
+                    taxonomyRow.style.display = value === 'taxonomy' ? '' : 'none';
+                    allTermsRow.style.display = value === 'post_type' ? '' : 'none';
                 }
 
                 exportType.addEventListener('change', toggleExportFields);
@@ -238,17 +307,34 @@ class WL_Page_CPT_Export_Import_ACF_Media {
     }
 
     private function render_import_report($report) {
-        $failed = !empty($report['media_failed']) ? $report['media_failed'] : [];
-        $class  = empty($failed) ? 'notice-success' : 'notice-warning';
+        $failed       = !empty($report['media_failed']) ? $report['media_failed'] : [];
+        $terms_failed = !empty($report['terms_failed']) ? $report['terms_failed'] : [];
+        $class        = (empty($failed) && empty($terms_failed)) ? 'notice-success' : 'notice-warning';
+
+        $terms_created = isset($report['terms_created']) ? intval($report['terms_created']) : 0;
+        $terms_updated = isset($report['terms_updated']) ? intval($report['terms_updated']) : 0;
         ?>
         <div class="notice <?php echo esc_attr($class); ?>">
             <p><strong>Import completed.</strong></p>
             <p>
                 Posts created: <strong><?php echo intval($report['posts_created']); ?></strong> &nbsp;|&nbsp;
+                Terms created: <strong><?php echo $terms_created; ?></strong> &nbsp;|&nbsp;
+                Terms matched: <strong><?php echo $terms_updated; ?></strong> &nbsp;|&nbsp;
                 Media imported: <strong><?php echo intval($report['media_imported']); ?></strong> &nbsp;|&nbsp;
                 Media already present: <strong><?php echo intval($report['media_reused']); ?></strong> &nbsp;|&nbsp;
                 Media failed: <strong><?php echo count($failed); ?></strong>
             </p>
+
+            <?php if (!empty($terms_failed)) : ?>
+                <p>These taxonomy terms could not be imported:</p>
+                <ul style="list-style:disc;margin-left:20px;">
+                    <?php foreach ($terms_failed as $failure) : ?>
+                        <li>
+                            <code><?php echo esc_html($failure['term']); ?></code> — <?php echo esc_html($failure['reason']); ?>
+                        </li>
+                    <?php endforeach; ?>
+                </ul>
+            <?php endif; ?>
 
             <?php if (!empty($failed)) : ?>
                 <p>These media files could not be imported:</p>
@@ -266,6 +352,21 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         delete_transient('wl_cpt_import_report_' . get_current_user_id());
     }
 
+    private function exportable_taxonomies() {
+        $taxonomies = get_taxonomies([], 'objects');
+        $exportable = [];
+
+        foreach ($taxonomies as $taxonomy) {
+            if (in_array($taxonomy->name, $this->internal_taxonomies, true)) {
+                continue;
+            }
+
+            $exportable[$taxonomy->name] = $taxonomy;
+        }
+
+        return $exportable;
+    }
+
     /* ---------------------------------------------------------------------
      * Export
      * ------------------------------------------------------------------ */
@@ -280,10 +381,12 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         @set_time_limit(0);
         @ini_set('memory_limit', '1024M');
 
-        $export_type  = !empty($_POST['export_type']) ? sanitize_key($_POST['export_type']) : 'page';
-        $embed_media  = !empty($_POST['embed_media']);
-        $posts        = [];
-        $export_label = '';
+        $export_type       = !empty($_POST['export_type']) ? sanitize_key($_POST['export_type']) : 'page';
+        $embed_media       = !empty($_POST['embed_media']);
+        $include_all_terms = !empty($_POST['include_all_terms']);
+        $posts             = [];
+        $bulk_taxonomies   = [];
+        $export_label      = '';
 
         if ($export_type === 'page') {
             $page_id = !empty($_POST['page_id']) ? intval($_POST['page_id']) : 0;
@@ -315,7 +418,20 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                 'order'          => 'ASC',
             ]);
 
+            if ($include_all_terms) {
+                $bulk_taxonomies = get_object_taxonomies($post_type);
+            }
+
             $export_label = $post_type;
+        } elseif ($export_type === 'taxonomy') {
+            $taxonomy = !empty($_POST['taxonomy']) ? sanitize_key($_POST['taxonomy']) : '';
+
+            if (!$taxonomy || !taxonomy_exists($taxonomy)) {
+                wp_die('Please select a valid taxonomy.');
+            }
+
+            $bulk_taxonomies = [$taxonomy];
+            $export_label    = 'taxonomy-' . $taxonomy;
         } else {
             wp_die('Invalid export type.');
         }
@@ -327,8 +443,16 @@ class WL_Page_CPT_Export_Import_ACF_Media {
             $exported_posts[] = $this->build_post_export($post);
         }
 
+        foreach ($bulk_taxonomies as $bulk_taxonomy) {
+            $this->register_all_terms($bulk_taxonomy);
+        }
+
+        if ($export_type === 'taxonomy' && empty($this->term_manifest)) {
+            wp_die('That taxonomy has no terms to export.');
+        }
+
         $header = [
-            'plugin_version' => '2.0.0',
+            'plugin_version' => '2.1.0',
             'schema'         => self::SCHEMA_VERSION,
             'site_url'       => site_url(),
             'home_url'       => home_url(),
@@ -353,6 +477,8 @@ class WL_Page_CPT_Export_Import_ACF_Media {
     }
 
     private function stream_export($header, $exported_posts, $embed_media) {
+        $terms = $this->exportable_terms();
+
         echo '{';
 
         foreach ($header as $key => $value) {
@@ -360,6 +486,11 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         }
 
         echo '"posts":' . wp_json_encode($exported_posts, JSON_UNESCAPED_SLASHES) . ',';
+
+        // Keyed by "taxonomy:term_id", so this always encodes as a JSON object —
+        // except when there is nothing to export.
+        echo '"terms":' . (empty($terms) ? '{}' : wp_json_encode($terms, JSON_UNESCAPED_SLASHES)) . ',';
+
         echo '"media":{';
 
         $first = true;
@@ -403,34 +534,10 @@ class WL_Page_CPT_Export_Import_ACF_Media {
     private function build_post_export($post) {
         $post_id     = $post->ID;
         $featured_id = get_post_thumbnail_id($post_id);
-        $all_meta    = get_post_meta($post_id);
 
         $this->collect_media_from_content($post->post_content);
 
-        $export_meta     = [];
-        $media_meta_keys = [];
-
-        foreach ($all_meta as $meta_key => $meta_values) {
-            if (in_array($meta_key, $this->skip_meta_keys, true)) {
-                continue;
-            }
-
-            $holds_media_ids = $this->meta_key_holds_media_ids($meta_key, $all_meta);
-
-            if ($holds_media_ids) {
-                $media_meta_keys[] = $meta_key;
-            }
-
-            $export_meta[$meta_key] = [];
-
-            foreach ($meta_values as $value) {
-                $value = maybe_unserialize($value);
-
-                $this->collect_media_from_value($value, $holds_media_ids);
-
-                $export_meta[$meta_key][] = $value;
-            }
-        }
+        $meta = $this->build_meta_export(get_post_meta($post_id));
 
         return [
             'old_id'          => $post_id,
@@ -445,8 +552,57 @@ class WL_Page_CPT_Export_Import_ACF_Media {
             'post_parent'     => $post->post_parent,
             'featured_media'  => $featured_id ? $this->register_attachment($featured_id) : '',
             'taxonomies'      => $this->export_taxonomies($post_id, $post->post_type),
+            'meta'            => $meta['meta'],
+            'media_meta_keys' => $meta['media_meta_keys'],
+            'term_meta_keys'  => $meta['term_meta_keys'],
+        ];
+    }
+
+    /**
+     * Walks a raw meta array (post meta or term meta), registers every media
+     * file it references, and reports which keys hold attachment or term IDs so
+     * the importer knows which numbers to renumber.
+     */
+    private function build_meta_export($all_meta) {
+        $export_meta     = [];
+        $media_meta_keys = [];
+        $term_meta_keys  = [];
+
+        if (!is_array($all_meta)) {
+            $all_meta = [];
+        }
+
+        foreach ($all_meta as $meta_key => $meta_values) {
+            if (in_array($meta_key, $this->skip_meta_keys, true)) {
+                continue;
+            }
+
+            $holds_media_ids = $this->meta_key_holds_media_ids($meta_key, $all_meta);
+            $holds_term_ids  = !$holds_media_ids && $this->meta_key_holds_term_ids($meta_key);
+
+            if ($holds_media_ids) {
+                $media_meta_keys[] = $meta_key;
+            }
+
+            if ($holds_term_ids) {
+                $term_meta_keys[] = $meta_key;
+            }
+
+            $export_meta[$meta_key] = [];
+
+            foreach ((array) $meta_values as $value) {
+                $value = maybe_unserialize($value);
+
+                $this->collect_media_from_value($value, $holds_media_ids);
+
+                $export_meta[$meta_key][] = $value;
+            }
+        }
+
+        return [
             'meta'            => $export_meta,
             'media_meta_keys' => $media_meta_keys,
+            'term_meta_keys'  => $term_meta_keys,
         ];
     }
 
@@ -517,6 +673,15 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         }
 
         return (bool) apply_filters('wl_cpt_meta_key_holds_media_ids', false, $meta_key);
+    }
+
+    /**
+     * Term IDs stored in meta (an ACF taxonomy field, for one) cannot be told
+     * apart from any other number, so nothing is renumbered unless a site opts
+     * a key in through this filter.
+     */
+    private function meta_key_holds_term_ids($meta_key) {
+        return (bool) apply_filters('wl_cpt_meta_key_holds_term_ids', false, $meta_key);
     }
 
     private function extract_numeric_ids($value) {
@@ -673,20 +838,28 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
         unset($json);
 
-        if (!is_array($data) || empty($data['posts']) || !is_array($data['posts'])) {
+        $has_posts = is_array($data) && !empty($data['posts']) && is_array($data['posts']);
+        $has_terms = is_array($data) && !empty($data['terms']) && is_array($data['terms']);
+
+        if (!$has_posts && !$has_terms) {
             wp_die('Invalid JSON file.');
         }
 
-        if (empty($data['schema']) || intval($data['schema']) < self::SCHEMA_VERSION) {
-            wp_die('This JSON was produced by an older version of the plugin. Please re-export it from the source site using version 2.0.0 so the media files are included.');
+        if (empty($data['schema']) || intval($data['schema']) < self::MIN_SCHEMA_VERSION) {
+            wp_die('This JSON was produced by an older version of the plugin. Please re-export it from the source site using version 2.1.0 so the media files and taxonomy terms are included.');
         }
 
         $this->report = [
             'posts_created'  => 0,
+            'terms_created'  => 0,
+            'terms_updated'  => 0,
+            'terms_failed'   => [],
             'media_imported' => 0,
             'media_reused'   => 0,
             'media_failed'   => [],
         ];
+
+        $this->update_terms = !empty($_POST['update_terms']);
 
         $this->source_base = !empty($_POST['source_url'])
             ? untrailingslashit(esc_url_raw(wp_unslash($_POST['source_url'])))
@@ -705,6 +878,21 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         }
 
         $this->build_url_replacements();
+
+        // Terms come before posts so the media they point at is already
+        // renumbered and the posts can be attached to the finished terms.
+        if ($has_terms) {
+            $this->import_terms($data['terms']);
+
+            unset($data['terms']);
+        }
+
+        if (!$has_posts) {
+            set_transient('wl_cpt_import_report_' . get_current_user_id(), $this->report, 10 * MINUTE_IN_SECONDS);
+
+            wp_safe_redirect(admin_url('tools.php?page=wl-cpt-export-import&imported=1'));
+            exit;
+        }
 
         $post_id_map = [];
         $parent_map  = [];
@@ -813,26 +1001,39 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                 ? $item['media_meta_keys']
                 : [];
 
-            $this->import_meta($new_post_id, $item['meta'], $media_meta_keys);
+            $term_meta_keys = !empty($item['term_meta_keys']) && is_array($item['term_meta_keys'])
+                ? $item['term_meta_keys']
+                : [];
+
+            $this->import_meta('post', $new_post_id, $item['meta'], $media_meta_keys, $term_meta_keys);
         }
 
         return $new_post_id;
     }
 
-    private function import_meta($post_id, $meta, $media_meta_keys) {
+    /**
+     * Shared by posts and terms — $meta_type is 'post' or 'term'.
+     */
+    private function import_meta($meta_type, $object_id, $meta, $media_meta_keys, $term_meta_keys = []) {
         foreach ($meta as $meta_key => $values) {
             if (in_array($meta_key, $this->skip_meta_keys, true)) {
                 continue;
             }
 
-            $numeric_is_media = in_array($meta_key, $media_meta_keys, true);
+            $numeric_map = null;
 
-            delete_post_meta($post_id, $meta_key);
+            if (in_array($meta_key, $media_meta_keys, true)) {
+                $numeric_map = $this->media_id_map;
+            } elseif (in_array($meta_key, $term_meta_keys, true)) {
+                $numeric_map = $this->term_id_map;
+            }
+
+            delete_metadata($meta_type, $object_id, $meta_key);
 
             foreach ((array) $values as $value) {
-                $value = $this->remap_meta_value($value, $numeric_is_media);
+                $value = $this->remap_meta_value($value, $numeric_map);
 
-                add_post_meta($post_id, $meta_key, wp_slash($value));
+                add_metadata($meta_type, $object_id, $meta_key, wp_slash($value));
             }
         }
     }
@@ -1208,12 +1409,16 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         return $attributes;
     }
 
-    private function remap_meta_value($value, $numeric_is_media) {
+    /**
+     * $numeric_map is the ID map bare numbers in this meta key should be looked
+     * up in — media IDs, term IDs, or null when numbers must be left alone.
+     */
+    private function remap_meta_value($value, $numeric_map = null) {
         if (is_array($value)) {
             $remapped = [];
 
             foreach ($value as $key => $item) {
-                $remapped[$key] = $this->remap_meta_value($item, $numeric_is_media);
+                $remapped[$key] = $this->remap_meta_value($item, $numeric_map);
             }
 
             return $this->remap_media_id_structure($remapped);
@@ -1223,7 +1428,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
             $decoded = $this->maybe_decode_json($value);
 
             if ($decoded !== null) {
-                $remapped = $this->remap_meta_value($decoded, false);
+                $remapped = $this->remap_meta_value($decoded, null);
                 $flags    = JSON_UNESCAPED_UNICODE;
 
                 if (strpos($value, '\\/') === false) {
@@ -1239,15 +1444,15 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
             $value = $this->replace_media_urls($value);
 
-            if ($numeric_is_media) {
-                $value = $this->remap_numeric_id_list($value);
+            if (!empty($numeric_map)) {
+                $value = $this->remap_numeric_id_list($value, $numeric_map);
             }
 
             return $value;
         }
 
-        if ($numeric_is_media && is_numeric($value) && isset($this->media_id_map[intval($value)])) {
-            return $this->media_id_map[intval($value)];
+        if (!empty($numeric_map) && is_numeric($value) && isset($numeric_map[intval($value)])) {
+            return $numeric_map[intval($value)];
         }
 
         return $value;
@@ -1278,7 +1483,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         return $value;
     }
 
-    private function remap_numeric_id_list($value) {
+    private function remap_numeric_id_list($value, $numeric_map) {
         if (!preg_match('#^\s*\d+(\s*,\s*\d+)*\s*$#', $value)) {
             return $value;
         }
@@ -1286,8 +1491,8 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         $ids = array_map('trim', explode(',', $value));
 
         foreach ($ids as $index => $id) {
-            if (isset($this->media_id_map[intval($id)])) {
-                $ids[$index] = $this->media_id_map[intval($id)];
+            if (isset($numeric_map[intval($id)])) {
+                $ids[$index] = $numeric_map[intval($id)];
             }
         }
 
@@ -1517,6 +1722,10 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         $data       = [];
 
         foreach ($taxonomies as $taxonomy) {
+            if (in_array($taxonomy, $this->internal_taxonomies, true)) {
+                continue;
+            }
+
             $terms = wp_get_object_terms($post_id, $taxonomy);
 
             if (empty($terms) || is_wp_error($terms)) {
@@ -1527,11 +1736,261 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                 $data[$taxonomy][] = [
                     'name' => $term->name,
                     'slug' => $term->slug,
+                    'key'  => $this->register_term($term),
                 ];
             }
         }
 
         return $data;
+    }
+
+    private function register_all_terms($taxonomy) {
+        if (!$taxonomy || !taxonomy_exists($taxonomy) || in_array($taxonomy, $this->internal_taxonomies, true)) {
+            return;
+        }
+
+        $terms = get_terms([
+            'taxonomy'   => $taxonomy,
+            'hide_empty' => false,
+            'orderby'    => 'parent',
+            'order'      => 'ASC',
+        ]);
+
+        if (is_wp_error($terms)) {
+            return;
+        }
+
+        foreach ($terms as $term) {
+            $this->register_term($term);
+        }
+    }
+
+    /**
+     * Adds a term to the export, together with its ancestors so the hierarchy
+     * can be rebuilt, and registers every image its description or term meta
+     * points at (ACF term image/file/gallery fields, WooCommerce category
+     * thumbnails).
+     */
+    private function register_term($term) {
+        if (is_numeric($term)) {
+            $term = get_term(intval($term));
+        }
+
+        if (!$term || is_wp_error($term) || empty($term->term_id)) {
+            return '';
+        }
+
+        $key = $term->taxonomy . ':' . $term->term_id;
+
+        if (isset($this->term_manifest[$key])) {
+            return $key;
+        }
+
+        // Reserve the slot first so a broken parent chain cannot loop forever.
+        $this->term_manifest[$key] = true;
+
+        $parent_key = '';
+
+        if (!empty($term->parent)) {
+            $parent = get_term(intval($term->parent), $term->taxonomy);
+
+            if ($parent && !is_wp_error($parent)) {
+                $parent_key = $this->register_term($parent);
+            }
+        }
+
+        $this->collect_media_from_content($term->description);
+
+        $meta = $this->build_meta_export(get_term_meta($term->term_id));
+
+        $this->term_manifest[$key] = [
+            'key'             => $key,
+            'term_id'         => intval($term->term_id),
+            'taxonomy'        => $term->taxonomy,
+            'name'            => $term->name,
+            'slug'            => $term->slug,
+            'description'     => $term->description,
+            'parent_key'      => $parent_key,
+            'meta'            => $meta['meta'],
+            'media_meta_keys' => $meta['media_meta_keys'],
+            'term_meta_keys'  => $meta['term_meta_keys'],
+        ];
+
+        return $key;
+    }
+
+    private function exportable_terms() {
+        $terms = [];
+
+        foreach ($this->term_manifest as $key => $entry) {
+            if (is_array($entry)) {
+                $terms[$key] = $entry;
+            }
+        }
+
+        return $terms;
+    }
+
+    private function import_terms($terms) {
+        $this->term_queue = [];
+
+        foreach ($terms as $key => $entry) {
+            if (is_array($entry) && !empty($entry['taxonomy'])) {
+                $this->term_queue[$key] = $entry;
+            }
+        }
+
+        foreach (array_keys($this->term_queue) as $key) {
+            $this->import_term($key, []);
+        }
+    }
+
+    /**
+     * Creates or matches a single term, resolving its parent first. $stack
+     * guards against a parent chain that points back at itself.
+     */
+    private function import_term($key, $stack = []) {
+        if (isset($this->term_key_map[$key])) {
+            return $this->term_key_map[$key];
+        }
+
+        if (!isset($this->term_queue[$key]) || isset($stack[$key])) {
+            return 0;
+        }
+
+        $entry    = $this->term_queue[$key];
+        $taxonomy = sanitize_key($entry['taxonomy']);
+
+        $name = !empty($entry['name']) ? $entry['name'] : '';
+        $slug = !empty($entry['slug']) ? sanitize_title($entry['slug']) : sanitize_title($name);
+
+        if ($name === '') {
+            $name = $slug;
+        }
+
+        if ($name === '' || $slug === '') {
+            return 0;
+        }
+
+        if (!taxonomy_exists($taxonomy)) {
+            // One line per missing taxonomy rather than one per term.
+            if (!isset($this->missing_taxonomies[$taxonomy])) {
+                $this->missing_taxonomies[$taxonomy] = true;
+
+                $this->fail_term($taxonomy, 'this taxonomy is not registered on the target site — activate the plugin or theme that registers it, then import again');
+            }
+
+            return 0;
+        }
+
+        $stack[$key] = true;
+
+        $parent_id = !empty($entry['parent_key'])
+            ? $this->import_term($entry['parent_key'], $stack)
+            : 0;
+
+        $description = !empty($entry['description']) ? $this->remap_content($entry['description']) : '';
+
+        $existing = get_term_by('slug', $slug, $taxonomy);
+
+        if (!$existing) {
+            $existing = get_term_by('name', $name, $taxonomy);
+        }
+
+        $is_new  = false;
+        $term_id = 0;
+
+        if ($existing && !is_wp_error($existing)) {
+            $term_id = intval($existing->term_id);
+
+            if ($this->update_terms) {
+                $args = ['name' => $name];
+
+                if ($description !== '') {
+                    $args['description'] = $description;
+                }
+
+                if ($parent_id) {
+                    $args['parent'] = $parent_id;
+                }
+
+                wp_update_term($term_id, $taxonomy, $args);
+            }
+
+            $this->report['terms_updated']++;
+        } else {
+            $created = wp_insert_term($name, $taxonomy, [
+                'slug'        => $slug,
+                'description' => $description,
+                'parent'      => $parent_id,
+            ]);
+
+            if (is_wp_error($created)) {
+                $term_id = $this->term_id_from_error($created);
+
+                if (!$term_id) {
+                    $this->fail_term($name, $created->get_error_message());
+
+                    return 0;
+                }
+
+                $this->report['terms_updated']++;
+            } else {
+                $term_id = intval($created['term_id']);
+                $is_new  = true;
+
+                $this->report['terms_created']++;
+            }
+        }
+
+        if (!$term_id) {
+            return 0;
+        }
+
+        $this->term_key_map[$key] = $term_id;
+
+        if (!empty($entry['term_id'])) {
+            $this->term_id_map[intval($entry['term_id'])] = $term_id;
+        }
+
+        if (($is_new || $this->update_terms) && !empty($entry['meta']) && is_array($entry['meta'])) {
+            $media_meta_keys = !empty($entry['media_meta_keys']) && is_array($entry['media_meta_keys'])
+                ? $entry['media_meta_keys']
+                : [];
+
+            $term_meta_keys = !empty($entry['term_meta_keys']) && is_array($entry['term_meta_keys'])
+                ? $entry['term_meta_keys']
+                : [];
+
+            $this->import_meta('term', $term_id, $entry['meta'], $media_meta_keys, $term_meta_keys);
+        }
+
+        return $term_id;
+    }
+
+    /**
+     * wp_insert_term() reports an existing term through the error data, which is
+     * either the term ID or an array carrying it.
+     */
+    private function term_id_from_error($error) {
+        $data = $error->get_error_data();
+
+        if (is_array($data) && !empty($data['term_id'])) {
+            return intval($data['term_id']);
+        }
+
+        if (is_numeric($data)) {
+            return intval($data);
+        }
+
+        return 0;
+    }
+
+    private function fail_term($term, $reason) {
+        $this->report['terms_failed'][] = [
+            'term'   => $term,
+            'reason' => $reason,
+        ];
     }
 
     private function import_taxonomies($post_id, $taxonomies) {
@@ -1543,6 +2002,22 @@ class WL_Page_CPT_Export_Import_ACF_Media {
             $term_ids = [];
 
             foreach ($terms as $term_data) {
+                if (!is_array($term_data)) {
+                    continue;
+                }
+
+                // Exports from 2.1.0 onwards carry the full term in the "terms"
+                // section; older files only have the name and slug.
+                if (!empty($term_data['key'])) {
+                    $mapped = $this->import_term($term_data['key'], []);
+
+                    if ($mapped) {
+                        $term_ids[] = $mapped;
+
+                        continue;
+                    }
+                }
+
                 if (empty($term_data['name'])) {
                     continue;
                 }
