@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Page/CPT Export Import with ACF Media
- * Description: Export/import a selected page, post type, or taxonomy with content, featured images, content images, taxonomy terms (description, hierarchy, term meta and term images), post meta, and ACF image/file/gallery fields. Media files can be embedded inside the JSON so a local site can be imported into a live site, or the other way round.
- * Version: 2.1.0
+ * Description: Export/import any number of pages, post types and taxonomies in one file, with content, featured images, content images, taxonomy terms (description, hierarchy, term meta and term images), post meta, and ACF image/file/gallery fields. Media files can be embedded inside the JSON so a local site can be imported into a live site, or the other way round.
+ * Version: 2.2.0
  * Author: Isuru Perera
  */
 
@@ -84,226 +84,482 @@ class WL_Page_CPT_Export_Import_ACF_Media {
     }
 
     public function admin_page() {
-        $post_types = get_post_types(['public' => true], 'objects');
-        $taxonomies = $this->exportable_taxonomies();
+        $report = get_transient('wl_cpt_import_report_' . get_current_user_id());
+        ?>
+        <div class="wrap wl-eix">
+            <?php $this->render_admin_styles(); ?>
 
+            <h1>Page / CPT / Taxonomy Export Import</h1>
+            <p class="wl-eix-lede">
+                Tick any number of pages, post types and taxonomies — they all travel in a single JSON file, together
+                with their ACF images and media. Taxonomy terms carry their description, hierarchy, term meta and term
+                images. Leave a panel untouched to skip it.
+            </p>
+
+            <?php if (!empty($_GET['imported']) && is_array($report)) : ?>
+                <?php $this->render_import_report($report); ?>
+            <?php endif; ?>
+
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="wl-eix-card">
+                <?php wp_nonce_field('wl_cpt_export_nonce'); ?>
+
+                <input type="hidden" name="action" value="wl_cpt_export">
+
+                <div class="wl-eix-card-head">
+                    <h2>Export</h2>
+                    <p>Everything you tick below ends up in one file, so a page, a custom post type and a taxonomy can move together.</p>
+                </div>
+
+                <div class="wl-eix-grid">
+                    <?php
+                    $this->render_choice_panel([
+                        'id'       => 'pages',
+                        'title'    => 'Pages',
+                        'field'    => 'page_id[]',
+                        'singular' => 'page',
+                        'plural'   => 'pages',
+                        'empty'    => 'This site has no pages.',
+                        'items'    => $this->page_choices(),
+                        'note'     => 'A parent page that is not ticked is not exported, and its child arrives on the target site as a top-level page.',
+                    ]);
+
+                    $this->render_choice_panel([
+                        'id'       => 'post_types',
+                        'title'    => 'Post Types',
+                        'field'    => 'post_type[]',
+                        'singular' => 'post type',
+                        'plural'   => 'post types',
+                        'empty'    => 'No public post types are registered.',
+                        'items'    => $this->post_type_choices(),
+                        'note'     => 'Every post of a ticked type is exported, whatever its status.',
+                    ]);
+
+                    $this->render_choice_panel([
+                        'id'       => 'taxonomies',
+                        'title'    => 'Taxonomies',
+                        'field'    => 'taxonomy[]',
+                        'singular' => 'taxonomy',
+                        'plural'   => 'taxonomies',
+                        'empty'    => 'No taxonomies are registered.',
+                        'items'    => $this->taxonomy_choices(),
+                        'note'     => 'Terms travel with their description, parent, term meta and images — ACF term image/gallery fields and WooCommerce category thumbnails included. Terms can be exported on their own, with no posts at all.',
+                    ]);
+                    ?>
+                </div>
+
+                <div class="wl-eix-options">
+                    <label class="wl-eix-option">
+                        <input type="checkbox" name="embed_media" value="1" checked>
+                        <span class="wl-eix-option-text">
+                            <strong>Embed the media files inside the JSON</strong>
+                            <span>
+                                Keep this on when moving a <strong>local site to a live site</strong>. The live server
+                                cannot download from a <code>.local</code> address, so the files have to travel inside
+                                the JSON. Turn it off only when the source site is publicly reachable from the target
+                                server — the JSON stays small, but the target downloads each file over HTTP.
+                            </span>
+                        </span>
+                    </label>
+
+                    <label class="wl-eix-option">
+                        <input type="checkbox" name="include_all_terms" value="1">
+                        <span class="wl-eix-option-text">
+                            <strong>Also export every term of the ticked post types' taxonomies</strong>
+                            <span>
+                                By default only the terms actually assigned to the exported posts travel. Turn this on
+                                to bring across the full term tree, including terms that currently have no posts.
+                            </span>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="wl-eix-footer">
+                    <p class="wl-eix-summary" id="wl_eix_summary" aria-live="polite">
+                        Nothing ticked yet.
+                    </p>
+
+                    <button type="submit" class="button button-primary" id="wl_eix_submit">Export JSON</button>
+                </div>
+            </form>
+
+            <form method="post" enctype="multipart/form-data" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="wl-eix-card">
+                <?php wp_nonce_field('wl_cpt_import_nonce'); ?>
+
+                <input type="hidden" name="action" value="wl_cpt_import">
+
+                <div class="wl-eix-card-head">
+                    <h2>Import</h2>
+                    <p>
+                        This server accepts uploads up to
+                        <strong><?php echo esc_html(size_format(wp_max_upload_size())); ?></strong>
+                        (<code>upload_max_filesize</code> <?php echo esc_html(ini_get('upload_max_filesize')); ?>,
+                        <code>post_max_size</code> <?php echo esc_html(ini_get('post_max_size')); ?>).
+                        Anything bigger has to go up by FTP into
+                        <code><?php echo esc_html($this->uploads_info()['basedir']); ?></code>
+                        and be pointed at with the server path field.
+                    </p>
+                </div>
+
+                <div class="wl-eix-field">
+                    <label class="wl-eix-label" for="wl_import_file">JSON file</label>
+                    <input type="file" name="import_file" id="wl_import_file" accept=".json,application/json">
+                    <p class="description">Upload the file produced by the export above.</p>
+                </div>
+
+                <div class="wl-eix-field">
+                    <label class="wl-eix-label" for="wl_server_path">Or a path inside the uploads folder</label>
+                    <input type="text" name="server_path" id="wl_server_path" class="regular-text"
+                           placeholder="wl-export-product-2026-08-14-10-30-00.json">
+                    <p class="description">
+                        Filename or path of a JSON file already sitting in the uploads folder. Use this when the export
+                        is too large to upload through the browser.
+                    </p>
+                </div>
+
+                <div class="wl-eix-field">
+                    <label class="wl-eix-label" for="wl_source_url">Source URL override</label>
+                    <input type="url" name="source_url" id="wl_source_url" class="regular-text"
+                           placeholder="https://staging.example.com">
+                    <p class="description">
+                        Only used when the JSON has no embedded media. Media URLs are re-pointed at this address before
+                        downloading, which helps when the files were exported from an unreachable host but are available
+                        somewhere else.
+                    </p>
+                </div>
+
+                <div class="wl-eix-options">
+                    <label class="wl-eix-option">
+                        <input type="checkbox" name="update_terms" value="1" checked>
+                        <span class="wl-eix-option-text">
+                            <strong>Update terms that already exist on this site</strong>
+                            <span>
+                                A term is matched by slug, then by name. With this on, the matched term's name,
+                                description, parent, term meta and term images are overwritten with the exported values.
+                                Turn it off to leave existing terms untouched and only attach posts to them.
+                            </span>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="wl-eix-footer">
+                    <p class="wl-eix-summary">Media already on this site is reused rather than uploaded twice.</p>
+
+                    <button type="submit" class="button button-primary">Import JSON</button>
+                </div>
+            </form>
+        </div>
+
+        <script>
+            document.addEventListener('DOMContentLoaded', function () {
+                const groups = Array.prototype.slice.call(document.querySelectorAll('.wl-eix-group'));
+                const summary = document.getElementById('wl_eix_summary');
+                const submit = document.getElementById('wl_eix_submit');
+
+                if (!groups.length) {
+                    return;
+                }
+
+                function itemsOf(group) {
+                    return Array.prototype.slice.call(group.querySelectorAll('.wl-eix-item'));
+                }
+
+                function checkedCount(group) {
+                    return group.querySelectorAll('input[type="checkbox"]:checked').length;
+                }
+
+                function updateSummary() {
+                    const parts = [];
+
+                    groups.forEach(function (group) {
+                        const count = checkedCount(group);
+
+                        if (count) {
+                            const word = count === 1 ? group.dataset.singular : group.dataset.plural;
+
+                            parts.push(count + ' ' + word);
+                        }
+                    });
+
+                    if (summary) {
+                        summary.textContent = parts.length
+                            ? 'Exporting ' + parts.join(', ') + '.'
+                            : 'Nothing ticked yet.';
+                    }
+
+                    if (submit) {
+                        submit.disabled = parts.length === 0;
+                    }
+                }
+
+                groups.forEach(function (group) {
+                    const badge = group.querySelector('[data-role="badge"]');
+                    const filter = group.querySelector('.wl-eix-filter');
+                    const noMatch = group.querySelector('.wl-eix-nomatch');
+
+                    function refresh() {
+                        const count = checkedCount(group);
+
+                        if (badge) {
+                            badge.textContent = count;
+                            badge.classList.toggle('is-active', count > 0);
+                        }
+
+                        updateSummary();
+                    }
+
+                    group.addEventListener('change', refresh);
+
+                    group.querySelectorAll('[data-action]').forEach(function (button) {
+                        button.addEventListener('click', function () {
+                            const wanted = button.dataset.action === 'all';
+
+                            // Only what the filter is currently showing, so
+                            // "All" after a search means "all of these".
+                            itemsOf(group).forEach(function (item) {
+                                if (item.classList.contains('is-hidden')) {
+                                    return;
+                                }
+
+                                const box = item.querySelector('input[type="checkbox"]');
+
+                                if (box) {
+                                    box.checked = wanted;
+                                }
+                            });
+
+                            refresh();
+                        });
+                    });
+
+                    if (filter) {
+                        filter.addEventListener('input', function () {
+                            const needle = filter.value.trim().toLowerCase();
+                            let visible = 0;
+
+                            itemsOf(group).forEach(function (item) {
+                                const match = needle === '' || item.dataset.search.indexOf(needle) !== -1;
+
+                                item.classList.toggle('is-hidden', !match);
+
+                                if (match) {
+                                    visible++;
+                                }
+                            });
+
+                            if (noMatch) {
+                                noMatch.hidden = visible > 0;
+                            }
+                        });
+                    }
+
+                    refresh();
+                });
+            });
+        </script>
+        <?php
+    }
+
+    private function render_admin_styles() {
+        ?>
+        <style>
+            .wl-eix { max-width: 1180px; }
+            .wl-eix-lede { max-width: 78ch; font-size: 14px; line-height: 1.6; color: #50575e; }
+            .wl-eix-card { background: #fff; border: 1px solid #dcdcde; border-radius: 6px; padding: 22px 24px 20px; margin: 20px 0; box-shadow: 0 1px 2px rgba(0, 0, 0, .05); }
+            .wl-eix-card-head { margin-bottom: 18px; }
+            .wl-eix-card-head h2 { margin: 0 0 5px; padding: 0; font-size: 17px; line-height: 1.4; }
+            .wl-eix-card-head p { margin: 0; max-width: 78ch; color: #50575e; }
+            .wl-eix-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(258px, 1fr)); gap: 16px; }
+            .wl-eix-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+            .wl-eix-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; background: #fff; border: 1px solid #dcdcde; border-radius: 5px; }
+            .wl-eix-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; background: #f6f7f7; border-bottom: 1px solid #dcdcde; }
+            .wl-eix-panel-title { font-size: 12px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; color: #1d2327; }
+            .wl-eix-badge { min-width: 22px; padding: 1px 7px; border-radius: 10px; background: #dcdcde; color: #50575e; font-size: 12px; font-weight: 600; text-align: center; }
+            .wl-eix-badge.is-active { background: #2271b1; color: #fff; }
+            .wl-eix-panel-tools { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #f0f0f1; }
+            .wl-eix-filter { flex: 1 1 auto; min-width: 0; }
+            .wl-eix-actions { flex: 0 0 auto; white-space: nowrap; font-size: 12px; color: #c3c4c7; }
+            .wl-eix-actions button { font-size: 12px; }
+            .wl-eix-list { max-height: 320px; overflow-y: auto; }
+            .wl-eix-item { display: flex; align-items: flex-start; gap: 9px; padding: 7px 12px; border-bottom: 1px solid #f0f0f1; cursor: pointer; }
+            .wl-eix-item:last-child { border-bottom: 0; }
+            .wl-eix-item:hover { background: #f0f6fc; }
+            .wl-eix-item.is-hidden { display: none; }
+            .wl-eix-item input[type="checkbox"] { flex: 0 0 auto; margin: 2px 0 0; }
+            .wl-eix-item-text { min-width: 0; }
+            .wl-eix-item-label { display: block; font-size: 13px; line-height: 1.35; color: #1d2327; overflow-wrap: anywhere; }
+            .wl-eix-item-meta { display: block; font-size: 11px; line-height: 1.5; color: #787c82; }
+            .wl-eix-empty, .wl-eix-nomatch { margin: 0; padding: 14px 12px; font-size: 13px; font-style: italic; color: #787c82; }
+            .wl-eix-note { margin: 8px 2px 0; font-size: 12px; line-height: 1.5; color: #787c82; }
+            .wl-eix-options { display: grid; gap: 14px; margin-top: 20px; padding-top: 18px; border-top: 1px solid #f0f0f1; }
+            .wl-eix-options:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+            .wl-eix-option { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+            .wl-eix-option input[type="checkbox"] { flex: 0 0 auto; margin: 3px 0 0; }
+            .wl-eix-option-text strong { display: block; font-size: 13px; color: #1d2327; }
+            .wl-eix-option-text > span { display: block; max-width: 78ch; margin-top: 3px; font-size: 12px; line-height: 1.6; color: #646970; }
+            .wl-eix-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 20px; padding-top: 16px; border-top: 1px solid #f0f0f1; }
+            .wl-eix-summary { margin: 0; font-size: 13px; color: #50575e; }
+            .wl-eix-field { max-width: 44em; margin-bottom: 18px; }
+            .wl-eix-label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 600; color: #1d2327; }
+            .wl-eix-field input[type="text"], .wl-eix-field input[type="url"] { width: 100%; }
+            .wl-eix-stats { display: flex; flex-wrap: wrap; gap: 6px 26px; margin: 10px 0 6px; padding: 0; list-style: none; }
+            .wl-eix-stats li { font-size: 12px; color: #50575e; }
+            .wl-eix-stats strong { display: block; font-size: 19px; font-weight: 600; line-height: 1.3; color: #1d2327; }
+            .wl-eix-fail { margin: 6px 0 10px 22px; list-style: disc; }
+            @media screen and (max-width: 782px) {
+                .wl-eix-card { padding: 16px; }
+                .wl-eix-list { max-height: 260px; }
+            }
+        </style>
+        <?php
+    }
+
+    /**
+     * One panel of checkboxes — the three export lists are identical apart from
+     * their contents.
+     */
+    private function render_choice_panel($panel) {
+        $items = $panel['items'];
+        ?>
+        <fieldset class="wl-eix-group"
+                  data-singular="<?php echo esc_attr($panel['singular']); ?>"
+                  data-plural="<?php echo esc_attr($panel['plural']); ?>">
+            <legend class="screen-reader-text"><?php echo esc_html($panel['title']); ?> to export</legend>
+
+            <div class="wl-eix-panel">
+                <div class="wl-eix-panel-head">
+                    <span class="wl-eix-panel-title"><?php echo esc_html($panel['title']); ?></span>
+                    <span class="wl-eix-badge" data-role="badge">0</span>
+                </div>
+
+                <?php if (!empty($items)) : ?>
+                    <div class="wl-eix-panel-tools">
+                        <input type="search" class="wl-eix-filter"
+                               placeholder="Filter <?php echo esc_attr(strtolower($panel['title'])); ?>&hellip;"
+                               aria-label="Filter <?php echo esc_attr(strtolower($panel['title'])); ?>">
+
+                        <span class="wl-eix-actions">
+                            <button type="button" class="button-link" data-action="all">All</button>
+                            <span aria-hidden="true">·</span>
+                            <button type="button" class="button-link" data-action="none">None</button>
+                        </span>
+                    </div>
+
+                    <div class="wl-eix-list">
+                        <?php foreach ($items as $item) : ?>
+                            <label class="wl-eix-item" data-search="<?php echo esc_attr($item['search']); ?>">
+                                <input type="checkbox"
+                                       name="<?php echo esc_attr($panel['field']); ?>"
+                                       value="<?php echo esc_attr($item['value']); ?>">
+
+                                <span class="wl-eix-item-text">
+                                    <span class="wl-eix-item-label"><?php echo esc_html($item['label']); ?></span>
+                                    <span class="wl-eix-item-meta"><?php echo esc_html($item['meta']); ?></span>
+                                </span>
+                            </label>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <p class="wl-eix-nomatch" hidden>Nothing matches that filter.</p>
+                <?php else : ?>
+                    <p class="wl-eix-empty"><?php echo esc_html($panel['empty']); ?></p>
+                <?php endif; ?>
+            </div>
+
+            <?php if (!empty($panel['note'])) : ?>
+                <p class="wl-eix-note"><?php echo esc_html($panel['note']); ?></p>
+            <?php endif; ?>
+        </fieldset>
+        <?php
+    }
+
+    private function page_choices() {
         $pages = get_pages([
             'post_status' => ['publish', 'draft', 'pending', 'private'],
             'sort_column' => 'post_title',
             'sort_order'  => 'ASC',
         ]);
 
-        $report = get_transient('wl_cpt_import_report_' . get_current_user_id());
-        ?>
-        <div class="wrap">
-            <h1>Page / CPT / Taxonomy Export Import</h1>
-            <p>Export/import a selected page, post type, or taxonomy with ACF images and media. Taxonomy terms travel with their description, hierarchy, term meta and term images.</p>
+        $choices = [];
 
-            <?php if (!empty($_GET['imported']) && is_array($report)) : ?>
-                <?php $this->render_import_report($report); ?>
-            <?php endif; ?>
+        foreach ($pages as $page) {
+            $title  = $page->post_title !== '' ? $page->post_title : '(no title)';
+            $status = $page->post_status === 'publish' ? '' : ' · ' . $page->post_status;
 
-            <hr>
+            $choices[] = $this->build_choice($page->ID, $title, 'ID ' . $page->ID . $status);
+        }
 
-            <h2>Export</h2>
+        return $choices;
+    }
 
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <?php wp_nonce_field('wl_cpt_export_nonce'); ?>
+    private function post_type_choices() {
+        $post_types = get_post_types(['public' => true], 'objects');
+        $choices    = [];
 
-                <input type="hidden" name="action" value="wl_cpt_export">
+        foreach ($post_types as $post_type) {
+            if ($post_type->name === 'attachment') {
+                continue;
+            }
 
-                <table class="form-table">
-                    <tr>
-                        <th scope="row">Select Export Type</th>
-                        <td>
-                            <select name="export_type" id="wl_export_type" required>
-                                <option value="page">Page</option>
-                                <option value="post_type">Post Type</option>
-                                <option value="taxonomy">Taxonomy (terms only)</option>
-                            </select>
-                        </td>
-                    </tr>
+            $total = $this->post_type_total($post_type->name);
 
-                    <tr id="wl_page_row">
-                        <th scope="row">Select Page</th>
-                        <td>
-                            <select name="page_id" id="wl_page_id">
-                                <option value="">Select Page</option>
+            $choices[] = $this->build_choice(
+                $post_type->name,
+                $post_type->label,
+                $post_type->name . ' · ' . number_format_i18n($total) . ($total === 1 ? ' post' : ' posts')
+            );
+        }
 
-                                <?php foreach ($pages as $page) : ?>
-                                    <option value="<?php echo esc_attr($page->ID); ?>">
-                                        <?php echo esc_html($page->post_title . ' — ID: ' . $page->ID); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </td>
-                    </tr>
+        return $choices;
+    }
 
-                    <tr id="wl_post_type_row" style="display:none;">
-                        <th scope="row">Select Post Type</th>
-                        <td>
-                            <select name="post_type" id="wl_post_type">
-                                <option value="">Select Post Type</option>
+    private function taxonomy_choices() {
+        $choices = [];
 
-                                <?php foreach ($post_types as $post_type) : ?>
-                                    <?php
-                                    if (in_array($post_type->name, ['attachment', 'page', 'post'], true)) {
-                                        continue;
-                                    }
-                                    ?>
-                                    <option value="<?php echo esc_attr($post_type->name); ?>">
-                                        <?php echo esc_html($post_type->label . ' (' . $post_type->name . ')'); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </td>
-                    </tr>
+        foreach ($this->exportable_taxonomies() as $taxonomy) {
+            $total = $this->taxonomy_term_total($taxonomy->name);
 
-                    <tr id="wl_taxonomy_row" style="display:none;">
-                        <th scope="row">Select Taxonomy</th>
-                        <td>
-                            <select name="taxonomy" id="wl_taxonomy">
-                                <option value="">Select Taxonomy</option>
+            $choices[] = $this->build_choice(
+                $taxonomy->name,
+                $taxonomy->label,
+                $taxonomy->name . ' · ' . number_format_i18n($total) . ($total === 1 ? ' term' : ' terms')
+            );
+        }
 
-                                <?php foreach ($taxonomies as $taxonomy) : ?>
-                                    <option value="<?php echo esc_attr($taxonomy->name); ?>">
-                                        <?php echo esc_html($taxonomy->label . ' (' . $taxonomy->name . ')'); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                            <p class="description">
-                                Exports every term of the taxonomy — name, slug, description, parent, term meta and
-                                any images attached to the terms (ACF term image/gallery fields, WooCommerce category
-                                thumbnails). No posts are included.
-                            </p>
-                        </td>
-                    </tr>
+        return $choices;
+    }
 
-                    <tr id="wl_all_terms_row" style="display:none;">
-                        <th scope="row">Taxonomy Terms</th>
-                        <td>
-                            <label>
-                                <input type="checkbox" name="include_all_terms" value="1">
-                                Also export every term of this post type's taxonomies
-                            </label>
-                            <p class="description">
-                                By default only the terms actually assigned to the exported posts travel. Turn this on
-                                to bring across the full term tree, including terms that currently have no posts.
-                            </p>
-                        </td>
-                    </tr>
+    private function build_choice($value, $label, $meta) {
+        return [
+            'value'  => $value,
+            'label'  => $label,
+            'meta'   => $meta,
+            'search' => strtolower($label . ' ' . $meta),
+        ];
+    }
 
-                    <tr>
-                        <th scope="row">Media Files</th>
-                        <td>
-                            <label>
-                                <input type="checkbox" name="embed_media" value="1" checked>
-                                Embed the media files inside the JSON
-                            </label>
-                            <p class="description">
-                                Keep this on when moving a <strong>local site to a live site</strong>. The live server
-                                cannot download from a <code>.local</code> address, so the files have to travel inside
-                                the JSON. Turn it off only when the source site is publicly reachable from the target
-                                server — the JSON stays small, but the target downloads each file over HTTP.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
+    private function post_type_total($post_type) {
+        $counts = wp_count_posts($post_type);
+        $total  = 0;
 
-                <?php submit_button('Export JSON'); ?>
-            </form>
+        foreach ((array) $counts as $status => $count) {
+            if (in_array($status, ['auto-draft', 'trash', 'inherit'], true)) {
+                continue;
+            }
 
-            <hr>
+            $total += intval($count);
+        }
 
-            <h2>Import JSON File</h2>
+        return $total;
+    }
 
-            <p class="description">
-                This server accepts uploads up to <strong><?php echo esc_html(size_format(wp_max_upload_size())); ?></strong>
-                (<code>upload_max_filesize</code> <?php echo esc_html(ini_get('upload_max_filesize')); ?>,
-                <code>post_max_size</code> <?php echo esc_html(ini_get('post_max_size')); ?>).
-                If the export is bigger than that, upload it with FTP into
-                <code><?php echo esc_html($this->uploads_info()['basedir']); ?></code> and use the server path field below.
-            </p>
+    private function taxonomy_term_total($taxonomy) {
+        $count = get_terms([
+            'taxonomy'   => $taxonomy,
+            'hide_empty' => false,
+            'fields'     => 'count',
+        ]);
 
-            <form method="post" enctype="multipart/form-data" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <?php wp_nonce_field('wl_cpt_import_nonce'); ?>
-
-                <input type="hidden" name="action" value="wl_cpt_import">
-
-                <table class="form-table">
-                    <tr>
-                        <th scope="row">JSON File</th>
-                        <td>
-                            <input type="file" name="import_file" accept=".json,application/json">
-                            <p class="description">Upload the exported JSON file.</p>
-                        </td>
-                    </tr>
-
-                    <tr>
-                        <th scope="row">Or Server Path</th>
-                        <td>
-                            <input type="text" name="server_path" class="regular-text" placeholder="wl-export-page-12-2026-08-10.json">
-                            <p class="description">
-                                Filename or path of a JSON file already sitting inside the uploads folder. Use this when
-                                the export is too large to upload through the browser.
-                            </p>
-                        </td>
-                    </tr>
-
-                    <tr>
-                        <th scope="row">Existing Terms</th>
-                        <td>
-                            <label>
-                                <input type="checkbox" name="update_terms" value="1" checked>
-                                Update terms that already exist on this site
-                            </label>
-                            <p class="description">
-                                A term is matched by slug, then by name. When this is on, the matched term's name,
-                                description, parent, term meta and term images are overwritten with the exported
-                                values. Turn it off to keep existing terms untouched and only attach posts to them.
-                            </p>
-                        </td>
-                    </tr>
-
-                    <tr>
-                        <th scope="row">Source URL Override</th>
-                        <td>
-                            <input type="url" name="source_url" class="regular-text" placeholder="https://staging.example.com">
-                            <p class="description">
-                                Only used when the JSON has no embedded media. Media URLs are re-pointed at this address
-                                before downloading, which is handy when the files were exported from an unreachable host
-                                but are available somewhere else.
-                            </p>
-                        </td>
-                    </tr>
-                </table>
-
-                <?php submit_button('Import JSON'); ?>
-            </form>
-        </div>
-
-        <script>
-            document.addEventListener('DOMContentLoaded', function () {
-                const exportType = document.getElementById('wl_export_type');
-                const pageRow = document.getElementById('wl_page_row');
-                const postTypeRow = document.getElementById('wl_post_type_row');
-                const taxonomyRow = document.getElementById('wl_taxonomy_row');
-                const allTermsRow = document.getElementById('wl_all_terms_row');
-
-                function toggleExportFields() {
-                    const value = exportType.value;
-
-                    pageRow.style.display = value === 'page' ? '' : 'none';
-                    postTypeRow.style.display = value === 'post_type' ? '' : 'none';
-                    taxonomyRow.style.display = value === 'taxonomy' ? '' : 'none';
-                    allTermsRow.style.display = value === 'post_type' ? '' : 'none';
-                }
-
-                exportType.addEventListener('change', toggleExportFields);
-                toggleExportFields();
-            });
-        </script>
-        <?php
+        return is_wp_error($count) ? 0 : intval($count);
     }
 
     private function render_import_report($report) {
@@ -313,21 +569,31 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
         $terms_created = isset($report['terms_created']) ? intval($report['terms_created']) : 0;
         $terms_updated = isset($report['terms_updated']) ? intval($report['terms_updated']) : 0;
+
+        $stats = [
+            'Posts created'  => intval($report['posts_created']),
+            'Terms created'  => $terms_created,
+            'Terms matched'  => $terms_updated,
+            'Media imported' => intval($report['media_imported']),
+            'Media reused'   => intval($report['media_reused']),
+            'Media failed'   => count($failed),
+        ];
         ?>
         <div class="notice <?php echo esc_attr($class); ?>">
             <p><strong>Import completed.</strong></p>
-            <p>
-                Posts created: <strong><?php echo intval($report['posts_created']); ?></strong> &nbsp;|&nbsp;
-                Terms created: <strong><?php echo $terms_created; ?></strong> &nbsp;|&nbsp;
-                Terms matched: <strong><?php echo $terms_updated; ?></strong> &nbsp;|&nbsp;
-                Media imported: <strong><?php echo intval($report['media_imported']); ?></strong> &nbsp;|&nbsp;
-                Media already present: <strong><?php echo intval($report['media_reused']); ?></strong> &nbsp;|&nbsp;
-                Media failed: <strong><?php echo count($failed); ?></strong>
-            </p>
+
+            <ul class="wl-eix-stats">
+                <?php foreach ($stats as $label => $value) : ?>
+                    <li>
+                        <strong><?php echo esc_html(number_format_i18n($value)); ?></strong>
+                        <?php echo esc_html($label); ?>
+                    </li>
+                <?php endforeach; ?>
+            </ul>
 
             <?php if (!empty($terms_failed)) : ?>
                 <p>These taxonomy terms could not be imported:</p>
-                <ul style="list-style:disc;margin-left:20px;">
+                <ul class="wl-eix-fail">
                     <?php foreach ($terms_failed as $failure) : ?>
                         <li>
                             <code><?php echo esc_html($failure['term']); ?></code> — <?php echo esc_html($failure['reason']); ?>
@@ -338,7 +604,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
             <?php if (!empty($failed)) : ?>
                 <p>These media files could not be imported:</p>
-                <ul style="list-style:disc;margin-left:20px;">
+                <ul class="wl-eix-fail">
                     <?php foreach ($failed as $failure) : ?>
                         <li>
                             <code><?php echo esc_html($failure['url']); ?></code> — <?php echo esc_html($failure['reason']); ?>
@@ -381,36 +647,38 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         @set_time_limit(0);
         @ini_set('memory_limit', '1024M');
 
-        $export_type       = !empty($_POST['export_type']) ? sanitize_key($_POST['export_type']) : 'page';
         $embed_media       = !empty($_POST['embed_media']);
         $include_all_terms = !empty($_POST['include_all_terms']);
-        $posts             = [];
-        $bulk_taxonomies   = [];
-        $export_label      = '';
 
-        if ($export_type === 'page') {
-            $page_id = !empty($_POST['page_id']) ? intval($_POST['page_id']) : 0;
+        $page_ids   = $this->posted_id_list('page_id');
+        $post_types = $this->posted_key_list('post_type');
+        $taxonomies = $this->posted_key_list('taxonomy');
 
-            if (!$page_id) {
-                wp_die('Please select a page.');
-            }
+        if (empty($page_ids) && empty($post_types) && empty($taxonomies)) {
+            wp_die('Select at least one page, post type, or taxonomy to export.');
+        }
 
+        $posts           = [];
+        $seen_posts      = [];
+        $bulk_taxonomies = [];
+
+        foreach ($page_ids as $page_id) {
             $page = get_post($page_id);
 
-            if (!$page || $page->post_type !== 'page') {
-                wp_die('Selected page not found.');
+            if (!$page || $page->post_type !== 'page' || isset($seen_posts[$page->ID])) {
+                continue;
             }
 
-            $posts        = [$page];
-            $export_label = 'page-' . $page_id;
-        } elseif ($export_type === 'post_type') {
-            $post_type = !empty($_POST['post_type']) ? sanitize_key($_POST['post_type']) : '';
+            $seen_posts[$page->ID] = true;
+            $posts[]               = $page;
+        }
 
-            if (!$post_type || !post_type_exists($post_type)) {
-                wp_die('Please select a valid post type.');
+        foreach ($post_types as $post_type) {
+            if (!post_type_exists($post_type)) {
+                continue;
             }
 
-            $posts = get_posts([
+            $found = get_posts([
                 'post_type'      => $post_type,
                 'post_status'    => 'any',
                 'posts_per_page' => -1,
@@ -418,23 +686,29 @@ class WL_Page_CPT_Export_Import_ACF_Media {
                 'order'          => 'ASC',
             ]);
 
+            foreach ($found as $found_post) {
+                // A page can be picked individually and again through its post
+                // type — it must only travel once.
+                if (isset($seen_posts[$found_post->ID])) {
+                    continue;
+                }
+
+                $seen_posts[$found_post->ID] = true;
+                $posts[]                     = $found_post;
+            }
+
             if ($include_all_terms) {
-                $bulk_taxonomies = get_object_taxonomies($post_type);
+                $bulk_taxonomies = array_merge($bulk_taxonomies, get_object_taxonomies($post_type));
             }
-
-            $export_label = $post_type;
-        } elseif ($export_type === 'taxonomy') {
-            $taxonomy = !empty($_POST['taxonomy']) ? sanitize_key($_POST['taxonomy']) : '';
-
-            if (!$taxonomy || !taxonomy_exists($taxonomy)) {
-                wp_die('Please select a valid taxonomy.');
-            }
-
-            $bulk_taxonomies = [$taxonomy];
-            $export_label    = 'taxonomy-' . $taxonomy;
-        } else {
-            wp_die('Invalid export type.');
         }
+
+        foreach ($taxonomies as $taxonomy) {
+            if (taxonomy_exists($taxonomy)) {
+                $bulk_taxonomies[] = $taxonomy;
+            }
+        }
+
+        $bulk_taxonomies = array_values(array_unique($bulk_taxonomies));
 
         $uploads       = $this->uploads_info();
         $exported_posts = [];
@@ -447,20 +721,25 @@ class WL_Page_CPT_Export_Import_ACF_Media {
             $this->register_all_terms($bulk_taxonomy);
         }
 
-        if ($export_type === 'taxonomy' && empty($this->term_manifest)) {
-            wp_die('That taxonomy has no terms to export.');
+        if (empty($exported_posts) && empty($this->term_manifest)) {
+            wp_die('Nothing matched that selection — the chosen post types have no posts and the chosen taxonomies have no terms.');
         }
 
         $header = [
-            'plugin_version' => '2.1.0',
-            'schema'         => self::SCHEMA_VERSION,
-            'site_url'       => site_url(),
-            'home_url'       => home_url(),
-            'upload_baseurl' => $uploads['baseurl'],
-            'export_type'    => $export_type,
-            'embedded_media' => $embed_media,
-            'exported_at'    => current_time('mysql'),
+            'plugin_version'      => '2.2.0',
+            'schema'              => self::SCHEMA_VERSION,
+            'site_url'            => site_url(),
+            'home_url'            => home_url(),
+            'upload_baseurl'      => $uploads['baseurl'],
+            'export_type'         => $this->export_type_summary($page_ids, $post_types, $taxonomies),
+            'exported_pages'      => $page_ids,
+            'exported_post_types' => $post_types,
+            'exported_taxonomies' => $taxonomies,
+            'embedded_media'      => $embed_media,
+            'exported_at'         => current_time('mysql'),
         ];
+
+        $export_label = $this->build_export_label($page_ids, $post_types, $taxonomies);
 
         $filename = 'wl-export-' . sanitize_title($export_label) . '-' . date('Y-m-d-H-i-s') . '.json';
 
@@ -474,6 +753,76 @@ class WL_Page_CPT_Export_Import_ACF_Media {
 
         $this->stream_export($header, $exported_posts, $embed_media);
         exit;
+    }
+
+    private function posted_id_list($field) {
+        if (empty($_POST[$field])) {
+            return [];
+        }
+
+        $values = array_map('intval', (array) wp_unslash($_POST[$field]));
+
+        return array_values(array_unique(array_filter($values)));
+    }
+
+    private function posted_key_list($field) {
+        if (empty($_POST[$field])) {
+            return [];
+        }
+
+        $values = array_map('sanitize_key', (array) wp_unslash($_POST[$field]));
+
+        return array_values(array_unique(array_filter($values)));
+    }
+
+    private function export_type_summary($page_ids, $post_types, $taxonomies) {
+        $kinds = 0;
+
+        $kinds += empty($page_ids) ? 0 : 1;
+        $kinds += empty($post_types) ? 0 : 1;
+        $kinds += empty($taxonomies) ? 0 : 1;
+
+        if ($kinds > 1) {
+            return 'mixed';
+        }
+
+        if (!empty($page_ids)) {
+            return 'page';
+        }
+
+        return empty($post_types) ? 'taxonomy' : 'post_type';
+    }
+
+    /**
+     * Turns the selection into something readable in a filename without letting
+     * a twenty-post-type export produce a filename nobody can use.
+     */
+    private function build_export_label($page_ids, $post_types, $taxonomies) {
+        $parts = [];
+
+        if (count($page_ids) === 1) {
+            $parts[] = 'page-' . reset($page_ids);
+        } elseif (!empty($page_ids)) {
+            $parts[] = 'pages-' . count($page_ids);
+        }
+
+        foreach ($post_types as $post_type) {
+            $parts[] = $post_type;
+        }
+
+        foreach ($taxonomies as $taxonomy) {
+            $parts[] = 'taxonomy-' . $taxonomy;
+        }
+
+        if (empty($parts)) {
+            return 'export';
+        }
+
+        if (count($parts) > 3) {
+            return 'mixed-' . count($parts);
+        }
+
+        return implode('-', $parts);
     }
 
     private function stream_export($header, $exported_posts, $embed_media) {
@@ -846,7 +1195,7 @@ class WL_Page_CPT_Export_Import_ACF_Media {
         }
 
         if (empty($data['schema']) || intval($data['schema']) < self::MIN_SCHEMA_VERSION) {
-            wp_die('This JSON was produced by an older version of the plugin. Please re-export it from the source site using version 2.1.0 so the media files and taxonomy terms are included.');
+            wp_die('This JSON was produced by an older version of the plugin. Please re-export it from the source site using version 2.2.0 so the media files and taxonomy terms are included.');
         }
 
         $this->report = [
